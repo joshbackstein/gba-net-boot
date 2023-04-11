@@ -25,8 +25,13 @@ void* firm_buffer = NULL;
 static const char* DEFAULT_FIRM_PATH = "open_agb_firm.firm";
 static const char* LUMA_FIRM_PATH = "/luma/payloads/open_agb_firm.firm";
 
-static FILE* rom_fd = NULL;
-static const char* ROM_PATH = "/rom.gba";
+static FS_Archive sdmcArchive;
+static FS_Path ROM_PATH;
+static FS_Path FINAL_ROM_PATH;
+static Handle rom_fd;
+
+static const char* ROM_PATH_STR = "/rom.gba.tmp";
+static const char* FINAL_ROM_PATH_STR = "/rom.gba";
 static const s32 MAX_ROM_SIZE = 1024*1024*32;
 
 #define PORT 31313
@@ -43,6 +48,7 @@ static u32* SOC_buffer = NULL;
 static u8* TCP_buffer = NULL;
 static s32 TCP_buffer_offset = 0;
 static s32 file_size = 0;
+static u32 bytes_written = 0;
 
 // 256 bytes for UDP buffer
 #define UDP_BUFFER_SIZE 0x100
@@ -53,6 +59,24 @@ static s32 tcp_downloader = -1;
 static s32 udp_listener = -1;
 
 void failExit(const char* fmt, ...);
+
+void initSdmcStructs() {
+	Result ret;
+	ret = FSUSER_OpenArchive(&sdmcArchive, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""));
+	if (R_FAILED(ret)) {
+		failExit("could not open sdmc archive\n");
+	}
+	ROM_PATH = fsMakePath(PATH_ASCII, ROM_PATH_STR);
+	FINAL_ROM_PATH = fsMakePath(PATH_ASCII, FINAL_ROM_PATH_STR);
+}
+
+void deinitSdmcStructs() {
+	Result ret;
+	ret = FSUSER_CloseArchive(sdmcArchive);
+	if (R_FAILED(ret)) {
+		failExit("could not close sdmc archive\n");
+	}
+}
 
 void checkFirmAddress() {
 	printf("Firm at 0x%08lx\n", (u32) firm_buffer + FIRM_OFFSET);
@@ -116,17 +140,58 @@ void loadOafFirm() {
 }
 
 void openRom() {
-	rom_fd = fopen(ROM_PATH, "wb");
-	if (rom_fd == NULL) {
+	Result ret;
+	ret = FSUSER_OpenFile(&rom_fd, sdmcArchive, ROM_PATH, FS_OPEN_CREATE | FS_OPEN_WRITE, 0);
+	if (R_FAILED(ret)) {
 		failExit("could not open ROM for writing\n");
 	}
-
-	// Go to beginning of file
-	fseek(rom_fd, 0, SEEK_SET);
 }
 
 void closeRom() {
-	fclose(rom_fd);
+	Result ret;
+	ret = FSFILE_Close(rom_fd);
+	if (R_FAILED(ret) && R_SUMMARY(ret) != RS_INVALIDARG) {
+		if (ENABLE_DEBUG) {
+			printf("Result %ld\n", ret);
+			printf("R_LEVEL %ld\n", R_LEVEL(ret));
+			printf("R_SUMMARY %ld\n", R_SUMMARY(ret));
+			printf("R_MODULE %ld\n", R_MODULE(ret));
+			printf("R_DESCRIPTION %ld\n", R_DESCRIPTION(ret));
+			printf("errno: %d\n", errno);
+			printf("errno str: %s\n", strerror(errno));
+		}
+		failExit("could not close ROM\n");
+	}
+}
+
+void moveRomToFinalPath() {
+	Result ret;
+	ret = FSUSER_DeleteFile(sdmcArchive, FINAL_ROM_PATH);
+	if (R_FAILED(ret) && R_SUMMARY(ret) != RS_NOTFOUND) {
+		if (ENABLE_DEBUG) {
+			printf("Result %ld\n", ret);
+			printf("R_LEVEL %ld\n", R_LEVEL(ret));
+			printf("R_SUMMARY %ld\n", R_SUMMARY(ret));
+			printf("R_MODULE %ld\n", R_MODULE(ret));
+			printf("R_DESCRIPTION %ld\n", R_DESCRIPTION(ret));
+			printf("errno: %d\n", errno);
+			printf("errno str: %s\n", strerror(errno));
+		}
+		failExit("could not delete existing ROM\n");
+	}
+	ret = FSUSER_RenameFile(sdmcArchive, ROM_PATH, sdmcArchive, FINAL_ROM_PATH);
+	if (R_FAILED(ret)) {
+		if (ENABLE_DEBUG) {
+			printf("Result %ld\n", ret);
+			printf("R_LEVEL %ld\n", R_LEVEL(ret));
+			printf("R_SUMMARY %ld\n", R_SUMMARY(ret));
+			printf("R_MODULE %ld\n", R_MODULE(ret));
+			printf("R_DESCRIPTION %ld\n", R_DESCRIPTION(ret));
+			printf("errno: %d\n", errno);
+			printf("errno str: %s\n", strerror(errno));
+		}
+		failExit("could not move ROM to final path\n");
+	}
 }
 
 // Returns true on successful connection
@@ -318,13 +383,21 @@ bool checkTcpSocket(struct sockaddr_in* addr) {
 	// No point in writing to the file until we've filled up the buffer
 	TCP_buffer_offset += recv_len;
 	if (TCP_buffer_offset == TCP_BUFFER_SIZE || recv_len == 0) {
+		openRom();
 		printf(CONSOLE_MAGENTA);
 		printf("Writing %ld bytes to file\n", TCP_buffer_offset);
 		printf(CONSOLE_RESET);
-		s32 written_bytes = fwrite(TCP_buffer, 1, TCP_buffer_offset, rom_fd);
-		if (written_bytes != TCP_buffer_offset) {
+		u32 num_bytes = 0;
+		Result ret;
+		ret = FSFILE_Write(rom_fd, &num_bytes, bytes_written, TCP_buffer, TCP_buffer_offset, FS_WRITE_FLUSH);
+		if (R_FAILED(ret)) {
+			failExit("could not write to file\n");
+		}
+		closeRom();
+		if (num_bytes != TCP_buffer_offset) {
 			failExit("could not write all bytes to file\n");
 		}
+		bytes_written += num_bytes;
 		TCP_buffer_offset = 0;
 	}
 
@@ -346,6 +419,9 @@ bool checkTcpSocket(struct sockaddr_in* addr) {
 int main(int argc, char** argv) {
 	int ret = 0;
 
+	initSdmcStructs();
+	atexit(deinitSdmcStructs);
+
 	atexit(closeSockets);
 
 	gfxInitDefault();
@@ -360,8 +436,7 @@ int main(int argc, char** argv) {
 	// Make sure the firm buffer is at the beginning of FCRAM
 	checkFirmAddress();
 
-	// Attempt to open ROM file for writing
-	openRom();
+	// Make sure we close the ROM before exiting
 	atexit(closeRom);
 
 	// Wait for wifi
@@ -402,6 +477,7 @@ int main(int argc, char** argv) {
 	struct sockaddr_in tcp_downloader_addr;
 	bool waiting_for_file = true;
 	bool should_reboot = false;
+	bool download_complete = false;
 	while (aptMainLoop()) {
 		gspWaitForVBlank();
 		hidScanInput();
@@ -418,6 +494,8 @@ int main(int argc, char** argv) {
 		if (!waiting_for_file) {
 			// Break out of loop so we can reboot into open_agb_firm
 			should_reboot = true;
+			// Assume download is complete
+			download_complete = true;
 			break;
 		}
 
@@ -430,7 +508,9 @@ int main(int argc, char** argv) {
 		if (kDown & KEY_START) break;
 	}
 
-	closeRom();
+	if (download_complete) {
+		moveRomToFinalPath();
+	}
 
 	if (ENABLE_DEBUG) {
 		printf("\nPress Start to continue\n");
