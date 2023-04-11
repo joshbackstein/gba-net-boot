@@ -13,7 +13,7 @@
 
 #include <3ds.h>
 
-static const char* APP_TITLE = "GBA Net Boot v0.0.1 Beta";
+static const char* APP_TITLE = "GBA Net Boot v0.0.2 Beta";
 static bool ENABLE_DEBUG = false;
 
 #define FCRAM_START_OLD_FW (0x14000000)
